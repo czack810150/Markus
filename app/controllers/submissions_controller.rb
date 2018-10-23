@@ -100,7 +100,7 @@ class SubmissionsController < ApplicationController
     end
     revisions_history = assignment_revisions.map do |revision|
       {
-        id: revision.revision_identifier,
+        id: revision.revision_identifier.to_s,
         id_ui: revision.revision_identifier_ui,
         timestamp: l(revision.timestamp),
         server_timestamp: l(revision.server_timestamp)
@@ -130,7 +130,8 @@ class SubmissionsController < ApplicationController
 
     # generate flash messages
     if @assignment.submission_rule.can_collect_now?(@grouping.inviter.section)
-      flash_message(:warning, @assignment.submission_rule.after_collection_message)
+      flash_message(:warning,
+                    @assignment.submission_rule.class.human_attribute_name(:after_collection_message))
     elsif @assignment.grouping_past_due_date?(@grouping)
       flash_message(:warning, @assignment.submission_rule.overtime_message(@grouping))
     end
@@ -158,7 +159,7 @@ class SubmissionsController < ApplicationController
     end
     entries = []
     grouping.group.access_repo do |repo|
-      if current_user.student? || params[:revision_identifier].nil?
+      if current_user.student? || params[:revision_identifier].blank?
         revision = repo.get_latest_revision
       else
         revision = repo.get_revision(params[:revision_identifier])
@@ -215,7 +216,7 @@ class SubmissionsController < ApplicationController
                        assignment_identifier: assignment.short_identifier)
     end
     if partition[1].count > 0
-      error = I18n.t('collect_submissions.could_not_collect_some',
+      error = I18n.t('submissions.collect.could_not_collect_some',
                      assignment_identifier: assignment.short_identifier)
     end
     flash_now(:success, success) unless success.empty?
@@ -248,6 +249,12 @@ class SubmissionsController < ApplicationController
       end
     rescue StandardError => e
       error = e.message
+    end
+    unless success.blank?
+      flash_message(:success, success)
+    end
+    unless error.blank?
+      flash_message(:error, error)
     end
     render json: { success: success, error: error }
   end
@@ -433,7 +440,8 @@ class SubmissionsController < ApplicationController
           end
           # Are we past collection time?
           if current_user.student? && @assignment.submission_rule.can_collect_now?(current_user.section)
-            flash_message(:warning, @assignment.submission_rule.commit_after_collection_message)
+            flash_message(:warning,
+                          @assignment.submission_rule.class.human_attribute_name(:commit_after_collection_message))
           end
           # can't use redirect_to here. See comment of this action for details.
           set_filebrowser_vars(@grouping)
@@ -472,18 +480,15 @@ class SubmissionsController < ApplicationController
     elsif file.is_pdf?
       render json: { type: 'pdf' }
     else
-      path = params[:path] || '/'
       grouping.group.access_repo do |repo|
         revision = repo.get_revision(submission.revision_identifier)
-
-        begin
-          raw_file = revision.files_at_path(File.join(assignment.repository_folder,
-                                                  path))[file.filename]
+        raw_file = revision.files_at_path(file.path)[file.filename]
+        if raw_file.nil?
+          file_contents = I18n.t('student.submission.missing_file',
+                                 file_name: file.filename)
+        else
           file_contents = repo.download_as_string(raw_file)
-        rescue Exception => e
-          render plain: I18n.t('student.submission.missing_file',
-                              file_name: file.filename, message: e.message)
-          next  # exit the block
+          file_contents.force_encoding('UTF-8')
         end
 
         if SubmissionFile.is_binary?(file_contents)
@@ -520,16 +525,9 @@ class SubmissionsController < ApplicationController
         return
       end
 
-      if SubmissionFile.is_binary?(file_contents)
-        # If the file appears to be binary, send it as a download
-        send_data file_contents,
-                  disposition: 'attachment',
-                  filename: params[:file_name]
-      else
-        # Otherwise, sanitize it for HTML and blast it out to the screen
-        sanitized_contents = ERB::Util.html_escape(file_contents)
-        render plain: sanitized_contents, layout: 'sanitized_html'
-      end
+      send_data file_contents,
+                disposition: 'attachment',
+                filename: params[:file_name]
     end
   end
 

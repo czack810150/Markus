@@ -287,8 +287,8 @@ class AssignmentsController < ApplicationController
       flash_message(:success, I18n.t('assignment.update_success'))
       redirect_to action: 'edit', id: params[:id]
     rescue SubmissionRule::InvalidRuleType => e
-      @assignment.errors.add(:base, t('assignment.error', message: e.message))
-      flash_message(:error, t('assignment.error', message: e.message))
+      @assignment.errors.add(:base, e.message)
+      flash_message(:error, e.message)
       render :edit, id: @assignment.id
     rescue
       render :edit, id: @assignment.id
@@ -368,6 +368,54 @@ class AssignmentsController < ApplicationController
       format.json {
         render json: @assignment.summary_json(@current_user)
       }
+    end
+  end
+
+  def stop_test
+    test_id = params[:test_run_id].to_i
+    AutotestCancelJob.perform_later(request.protocol + request.host_with_port, [test_id])
+    redirect_back(fallback_location: root_path)
+  end
+
+  def stop_batch_tests
+    test_runs = TestRun.where(test_batch_id: params[:test_batch_id]).pluck(:id)
+    AutotestCancelJob.perform_later(request.protocol + request.host_with_port, test_runs)
+    redirect_back(fallback_location: root_path)
+  end
+
+  def batch_runs
+    @assignment = Assignment.find(params[:id])
+
+    respond_to do |format|
+      format.html
+      format.json do
+        user_ids = current_user.admin? ? Admin.pluck(:id) : current_user.id
+        test_runs = TestRun.left_outer_joins(:test_batch, grouping: [:group, :current_result])
+                           .where(test_runs: {user_id: user_ids},
+                                  'groupings.assignment_id': @assignment.id)
+                           .pluck_to_hash(:id,
+                                          :test_batch_id,
+                                          :time_to_service,
+                                          :grouping_id,
+                                          :submission_id,
+                                          'test_batches.created_at',
+                                          'test_runs.created_at',
+                                          'groups.group_name',
+                                          'results.id')
+        status_hash = TestRun.statuses(test_runs.map { |tr| tr[:id] })
+        test_batches = TestBatch.where(id: (test_runs.map { |tr| tr[:test_batch_id] }).compact.uniq)
+        time_to_completion_hashes = test_batches.map(&:time_to_completion_hash)
+        time_estimates = time_to_completion_hashes.empty? ? Hash.new : time_to_completion_hashes.inject(&:merge)
+        test_runs.each do |test_run|
+          created_at_raw = test_run.delete('test_batches.created_at') || test_run.delete('test_runs.created_at')
+          test_run['created_at'] = I18n.l(created_at_raw)
+          test_run['status'] = status_hash[test_run['id']]
+          test_run['time_to_completion'] = time_estimates[test_run['id']] || ''
+          test_run['group_name'] = test_run.delete('groups.group_name')
+          test_run['result_id'] = test_run.delete('results.id')
+        end
+        render json: test_runs
+      end
     end
   end
 
@@ -769,16 +817,9 @@ class AssignmentsController < ApplicationController
         return
       end
 
-      if SubmissionFile.is_binary?(file_contents)
-        # If the file appears to be binary, send it as a download
-        send_data file_contents,
-                  disposition: 'attachment',
-                  filename: params[:file_name]
-      else
-        # Otherwise, sanitize it for HTML and blast it out to the screen
-        sanitized_contents = ERB::Util.html_escape(file_contents)
-        render plain: sanitized_contents, layout: 'sanitized_html'
-      end
+      send_data file_contents,
+                disposition: 'attachment',
+                filename: params[:file_name]
     end
   end
 
@@ -875,14 +916,32 @@ class AssignmentsController < ApplicationController
                          num_files_before != assignment.assignment_files.length
 
     # if there are no section due dates, destroy the objects that were created
-    if params[:assignment][:section_due_dates_type].nil? ||
-        params[:assignment][:section_due_dates_type] == '0'
+    if params[:assignment][:section_due_dates_type] == '0'
       assignment.section_due_dates.each(&:destroy)
       assignment.section_due_dates_type = false
       assignment.section_groups_only = false
     else
       assignment.section_due_dates_type = true
       assignment.section_groups_only = true
+    end
+
+    if params[:is_group_assignment] == 'true'
+      # Is the instructor forming groups?
+      if assignment_params[:student_form_groups] == '0'
+        assignment.invalid_override = true
+        # Increase group_max so that create_all_groups button is not displayed
+        # in the groups view.
+        assignment.group_max = 2
+      else
+        assignment.student_form_groups = true
+        assignment.invalid_override = false
+        assignment.group_name_autogenerated = true
+      end
+    else
+      assignment.student_form_groups = false
+      assignment.invalid_override = false
+      assignment.group_min = 1
+      assignment.group_max = 1
     end
 
     # Due to some funkiness, we need to handle submission rules separately
@@ -912,7 +971,7 @@ class AssignmentsController < ApplicationController
       # issues with foreign keys in the future, but not with the current
       # schema
       assignment.submission_rule.delete
-      assignment.submission_rule = potential_rule.new
+      assignment.submission_rule = potential_rule.create!(assignment: assignment)
 
       # this part of the update is particularly hacky, because the incoming
       # data will include some mix of the old periods and new periods; in
@@ -920,6 +979,10 @@ class AssignmentsController < ApplicationController
       # the case of a mixture the input is a hash, and if there are no
       # periods at all then the periods_attributes will be nil
       periods = submission_rule_params[:submission_rule_attributes][:periods_attributes]
+      begin
+        periods = periods.to_h
+      rescue
+      end
       periods = case periods
                 when Hash
                   # in this case, we do not care about the keys, because
@@ -933,30 +996,30 @@ class AssignmentsController < ApplicationController
                 end
       # now that we know what periods we want to keep, we can create them
       periods.each do |p|
-        assignment.submission_rule.periods << Period.new(p)
+        new_period = assignment.submission_rule.periods.build(p)
+        new_period.submission_rule = assignment.submission_rule
+        new_period.save!
       end
-
-    elsif !submission_rule_params.blank? # in this case Rails does what we want, so we'll take the easy route
-      assignment.submission_rule.update_attributes(submission_rule_params[:submission_rule_attributes])
-    end
-
-    if params[:is_group_assignment] == 'true'
-      # Is the instructor forming groups?
-      if assignment_params[:student_form_groups] == '0'
-        assignment.invalid_override = true
-        # Increase group_max so that create_all_groups button is not displayed
-        # in the groups view.
-        assignment.group_max = 2
-      else
-        assignment.student_form_groups = true
-        assignment.invalid_override = false
-        assignment.group_name_autogenerated = true
+    elsif !submission_rule_params.blank? # TODO: do this in a more Rails way
+      periods = submission_rule_params[:submission_rule_attributes][:periods_attributes]
+      begin
+        periods = periods.to_h
+      rescue
       end
-    else
-      assignment.student_form_groups = false
-      assignment.invalid_override = false
-      assignment.group_min = 1
-      assignment.group_max = 1
+      periods = case periods
+                when Hash
+                  periods.map { |_, p| p }.select { |p| p.key?(:hours) }
+                when Array
+                  periods
+                else
+                  []
+                end
+      assignment.submission_rule.periods_attributes = periods
+      assignment.submission_rule.periods.each do |period|
+        period.submission_rule = assignment.submission_rule
+        period.save
+      end
+      assignment.submission_rule.save
     end
 
     return assignment, new_required_files
